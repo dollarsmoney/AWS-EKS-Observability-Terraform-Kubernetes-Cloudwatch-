@@ -1,0 +1,20 @@
+# Exercise: trip "eks-pod-restarts" + see ERROR lines in the "container-errors" Logs Insights query.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crashloop
+  namespace: lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: crashloop }
+  template:
+    metadata:
+      labels: { app: crashloop }
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sh", "-c", "echo 'starting...'; sleep 10; echo 'ERROR: database connection refused (simulated)'; exit 1"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }

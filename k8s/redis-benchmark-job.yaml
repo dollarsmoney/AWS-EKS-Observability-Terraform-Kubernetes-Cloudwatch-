@@ -1,0 +1,26 @@
+# Exercise: load Redis (engine CPU, connections, Get/Set cmds) and generate slow-log entries.
+# Needs configmap "redis-endpoint" in namespace lab (see README).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-benchmark
+  namespace: lab
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: redis:7
+          envFrom:
+            - configMapRef: { name: redis-endpoint } # REDIS_HOST
+          command:
+            - sh
+            - -c
+            - |
+              echo "== benchmark: 1M ops, 50 clients, 100k random keys =="
+              redis-benchmark --tls -h $REDIS_HOST -p 6379 -n 1000000 -c 50 -r 100000 -t set,get,incr,lpush -q
+              echo "== KEYS * is O(N) -> lands in the slow log =="
+              for i in $(seq 1 10); do redis-cli --tls -h $REDIS_HOST KEYS '*' > /dev/null; done
+              echo done

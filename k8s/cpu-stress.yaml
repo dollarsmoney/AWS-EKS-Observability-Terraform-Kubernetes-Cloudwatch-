@@ -1,0 +1,20 @@
+# Exercise: trip the "eks-node-cpu-high" alarm. Each pod burns ~1 core (no limit set on purpose).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-stress
+  namespace: lab
+spec:
+  replicas: 4
+  selector:
+    matchLabels: { app: cpu-stress }
+  template:
+    metadata:
+      labels: { app: cpu-stress }
+    spec:
+      containers:
+        - name: burn
+          image: busybox:1.36
+          command: ["sh", "-c", "echo 'burning cpu'; while true; do :; done"]
+          resources:
+            requests: { cpu: 300m, memory: 16Mi }

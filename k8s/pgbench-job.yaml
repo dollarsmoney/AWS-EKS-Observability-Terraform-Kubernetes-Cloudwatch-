@@ -1,0 +1,30 @@
+# Exercise: load RDS (CPU, connections, latency) and write slow queries to the postgresql log.
+# Needs secret "db-creds" in namespace lab (see README).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pgbench
+  namespace: lab
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: pgbench
+          image: postgres:17
+          envFrom:
+            - secretRef: { name: db-creds } # PGHOST, PGUSER, PGPASSWORD, PGDATABASE
+          env:
+            - name: PGSSLMODE
+              value: require # RDS Postgres 15+ forces SSL
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "== init pgbench tables =="; pgbench -i -s 20
+              echo "== 5 min load, 20 clients =="; pgbench -c 20 -j 2 -T 300 -P 30
+              echo "== slow queries (>500ms) for Logs Insights =="
+              for i in $(seq 1 20); do psql -c "SELECT pg_sleep(1.2);" >/dev/null; done
+              echo done

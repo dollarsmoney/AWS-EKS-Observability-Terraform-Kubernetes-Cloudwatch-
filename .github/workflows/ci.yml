@@ -1,0 +1,228 @@
+name: CI
+
+# Lint -> security scans (Trivy, Checkov SAST, SonarQube, ZAP DAST) -> terraform plan against the real state.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: 1.16.3
+  TRIVY_IMAGE: aquasec/trivy:0.75.0
+
+jobs:
+  # ---------------------------------------------------------------- lint
+  lint:
+    name: Format, validate, TFLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate (root + bootstrap)
+        run: |
+          for dir in . bootstrap; do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - uses: terraform-linters/setup-tflint@v6.3.1
+        with:
+          tflint_version: v0.63.1
+
+      - name: TFLint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when downloading the AWS ruleset
+        run: |
+          tflint --init --config "$PWD/.tflint.hcl"
+          tflint --recursive --config "$PWD/.tflint.hcl" --format compact
+
+  # ---------------------------------------------------------------- trivy
+  trivy:
+    name: Trivy (IaC misconfig + secrets)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Misconfiguration scan (Terraform + Kubernetes) -> SARIF
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" config \
+            --format sarif --output trivy-config.sarif --exit-code 0 .
+
+      - name: Misconfiguration summary
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" config \
+            --format table --severity HIGH,CRITICAL --exit-code 0 . > trivy.txt || true
+          {
+            echo "## Trivy: HIGH/CRITICAL misconfigurations"
+            echo '```'
+            head -c 60000 trivy.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Secrets are the one finding that must fail the build.
+      - name: Secret scan (blocking)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" fs \
+            --scanners secret --exit-code 1 .
+
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy
+
+  # ---------------------------------------------------------------- SAST
+  sast:
+    name: Checkov (SAST)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform,kubernetes,github_actions
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: true # report, don't block: the lab has documented trade-offs (see README)
+
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  # ---------------------------------------------------------------- SonarQube
+  sonarqube:
+    name: SonarQube Cloud
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history for blame / new-code detection
+
+      - name: Skip notice
+        if: env.SONAR_TOKEN == ''
+        run: echo "::notice title=SonarQube skipped::Add the SONAR_TOKEN repo secret to enable SonarQube Cloud analysis."
+
+      - name: SonarQube scan
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        env:
+          SONAR_HOST_URL: https://sonarcloud.io
+
+  # ---------------------------------------------------------------- DAST
+  dast:
+    name: OWASP ZAP baseline (DAST)
+    runs-on: ubuntu-latest
+    if: vars.DAST_TARGET_URL != ''
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: ${{ vars.DAST_TARGET_URL }}
+          fail_action: false
+          allow_issue_writing: false
+
+  # ---------------------------------------------------------------- plan
+  plan:
+    name: Terraform plan
+    runs-on: ubuntu-latest
+    needs: [lint, trivy, sast]
+    if: vars.AWS_PLAN_ROLE_ARN != ''
+    permissions:
+      contents: read
+      id-token: write # OIDC -> AWS, no stored keys
+      pull-requests: write
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_VAR_alert_email: ${{ vars.TF_VAR_ALERT_EMAIL }}
+      TF_VAR_my_ip_cidr: ${{ secrets.TF_VAR_MY_IP_CIDR }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: terraform init (S3 backend)
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -input=false -no-color -lock-timeout=120s -out=tfplan | tee plan.txt
+          echo "summary=$(grep -E '^(Plan:|No changes\.)' plan.txt | tail -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Plan summary
+        run: |
+          {
+            echo "## Terraform plan"
+            echo "**${{ steps.plan.outputs.summary }}**"
+            echo
+            echo "<details><summary>Full plan output</summary>"
+            echo
+            echo '```hcl'
+            head -c 60000 plan.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: terraform-plan
+          path: plan.txt
+          retention-days: 7
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8').slice(-60000);
+            const body = `### Terraform plan\n**${{ steps.plan.outputs.summary }}**\n\n<details><summary>Show plan</summary>\n\n\`\`\`hcl\n${plan}\n\`\`\`\n</details>`;
+            await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+
+  plan-not-configured:
+    name: Terraform plan (not configured)
+    runs-on: ubuntu-latest
+    if: vars.AWS_PLAN_ROLE_ARN == ''
+    steps:
+      - run: echo "::notice title=Plan skipped::Run ./bootstrap and set AWS_PLAN_ROLE_ARN, TF_STATE_BUCKET, TF_VAR_ALERT_EMAIL (vars) and TF_VAR_MY_IP_CIDR (secret). See README."
