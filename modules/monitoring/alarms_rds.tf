@@ -25,6 +25,14 @@ locals {
       operator    = "GreaterThanThreshold"
       description = "RDS read latency > 20ms"
     }
+    # Write latency > 20ms often indicates storage I/O saturation or contention.
+    # Pairs with read_latency so you can distinguish read- vs write-heavy bottlenecks.
+    write_latency = {
+      metric      = "WriteLatency"
+      threshold   = 0.02 # seconds -> 20ms
+      operator    = "GreaterThanThreshold"
+      description = "RDS write latency > 20ms"
+    }
   }
 }
 
